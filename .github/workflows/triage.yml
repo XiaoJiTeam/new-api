@@ -1,0 +1,667 @@
+# 由中央标签配置生成；不检出或执行 PR 代码。
+name: XiaoJi issue and PR triage
+on:
+  issues:
+    types: [opened, edited, reopened, labeled, unlabeled]
+  pull_request_target:
+    types: [opened, edited, synchronize, reopened, ready_for_review, labeled, unlabeled]
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      number:
+        description: Issue 或 PR 编号
+        required: true
+        type: string
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+concurrency:
+  group: triage-${{ github.repository }}-${{ github.event.issue.number || github.event.pull_request.number || inputs.number }}
+  cancel-in-progress: false
+jobs:
+  classify:
+    if: github.event_name != 'issue_comment' || startsWith(github.event.comment.body, '/kind ') || startsWith(github.event.comment.body, '/area ') || startsWith(github.event.comment.body, '/priority ') || startsWith(github.event.comment.body, '/triage ')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Classify metadata
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          python3 - event <<'XIAOJI_TRIAGE_PY'
+          """GitHub Issue/PR 分诊。仅使用标准库；不检出、不执行贡献者代码。"""
+          from __future__ import annotations
+          
+          import argparse
+          import base64
+          import json
+          import os
+          import re
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from pathlib import Path
+          
+          BOT = 'github-actions[bot]'
+          WRITERS = {'write', 'maintain', 'admin'}
+          KINDS = ('bug', 'feature', 'task', 'refactor', 'docs', 'dependency', 'question')
+          PRIORITIES = ('p0', 'p1', 'p2', 'p3')
+          NEEDS = 'triage/needs-triage'
+          INFO = 'triage/needs-info'
+          
+          
+          class APIError(RuntimeError):
+              def __init__(self, status, path):
+                  super().__init__(f'GitHub API {status}: {path}')
+                  self.status = status
+          
+          
+          class GitHub:
+              def __init__(self, token=None):
+                  self.token = token or os.environ.get('GH_TOKEN') or os.environ.get('GITHUB_TOKEN')
+                  if not self.token:
+                      raise ValueError('需要 GH_TOKEN 或 GITHUB_TOKEN；不要把令牌写入配置。')
+                  self.base = os.environ.get('GITHUB_API_URL', 'https://api.github.com')
+                  self.permissions = {}
+          
+              def request(self, method, path, data=None):
+                  body = None if data is None else json.dumps(data).encode()
+                  request = urllib.request.Request(self.base + path, data=body, method=method,
+                      headers={'Authorization': f'Bearer {self.token}', 'Accept': 'application/vnd.github+json',
+                               'X-GitHub-Api-Version': '2022-11-28', 'Content-Type': 'application/json',
+                               'User-Agent': 'xiaoji-triage'})
+                  try:
+                      with urllib.request.urlopen(request, timeout=45) as response:
+                          raw = response.read()
+                          return json.loads(raw) if raw else None
+                  except urllib.error.HTTPError as exc:
+                      # 不输出请求头、正文或认证响应。
+                      raise APIError(exc.code, path.split('?')[0]) from None
+          
+              def pages(self, path):
+                  separator = '&' if '?' in path else '?'
+                  page = 1
+                  while True:
+                      rows = self.request('GET', f'{path}{separator}per_page=100&page={page}')
+                      if not isinstance(rows, list):
+                          raise ValueError('分页响应必须是列表')
+                      yield from rows
+                      if len(rows) < 100:
+                          break
+                      page += 1
+          
+              def writer(self, repo, login):
+                  key = (repo, login)
+                  if key not in self.permissions:
+                      try:
+                          result = self.request('GET', f'/repos/{repo}/collaborators/{urllib.parse.quote(login, safe="")}/permission')
+                      except APIError as exc:
+                          if exc.status == 404:
+                              self.permissions[key] = False
+                              return False
+                          raise
+                      self.permissions[key] = result.get('permission') in WRITERS
+                  return self.permissions[key]
+          
+              def graphql(self, query, **variables):
+                  result = self.request('POST', '/graphql', {'query': query, 'variables': variables})
+                  if result.get('errors'):
+                      raise RuntimeError('GraphQL 操作失败；请检查 Project 权限、字段类型和条目访问权限。')
+                  return result['data']
+          
+          
+          def load_config(api, repo, ref=None):
+              suffix = '?ref=' + urllib.parse.quote(ref, safe='') if ref else ''
+              data = api.request('GET', f'/repos/{repo}/contents/.github/triage.json{suffix}')
+              config = json.loads(base64.b64decode(data['content']))
+              validate_config(config)
+              return config
+          
+          
+          def validate_config(config):
+              if config.get('schema_version') != 1:
+                  raise ValueError('不支持的分诊配置版本')
+              labels = [x['name'] for x in config['labels']]
+              if len(labels) != len(set(labels)):
+                  raise ValueError('标签名称重复')
+              for label in config['labels']:
+                  if not re.fullmatch(r'[0-9a-fA-F]{6}', label['color']):
+                      raise ValueError('颜色必须是六位十六进制')
+                  if len(label['description']) > 100:
+                      raise ValueError('标签说明超过 GitHub 的 100 字符限制')
+              for area, rule in config['areas'].items():
+                  if not area.startswith('area/') or area not in labels or not rule.get('title'):
+                      raise ValueError('模块必须有名称、说明及标签定义')
+                  for pattern in rule['paths']:
+                      if pattern.startswith('/') or '..' in pattern.split('/'):
+                          raise ValueError('路径必须相对于仓库根目录')
+          
+          
+          def read_catalog(directory):
+              common = json.loads((directory.parent / 'common.json').read_text())
+              configs = {}
+              for path in sorted(directory.glob('*.json')):
+                  config = json.loads(path.read_text())
+                  config['labels'] = common + config['labels']
+                  validate_config(config)
+                  configs[config['repository']] = config
+              if not configs:
+                  raise ValueError('中央标签配置为空')
+              return configs
+          
+          
+          def matches(path, pattern):
+              """* 不跨目录；** 跨目录，**/ 也匹配零层目录。"""
+              parts = []
+              i = 0
+              while i < len(pattern):
+                  if pattern[i:i + 3] == '**/':
+                      parts.append('(?:.*/)?'); i += 3
+                  elif pattern[i:i + 2] == '**':
+                      parts.append('.*'); i += 2
+                  elif pattern[i] == '*':
+                      parts.append('[^/]*'); i += 1
+                  elif pattern[i] == '?':
+                      parts.append('[^/]'); i += 1
+                  else:
+                      parts.append(re.escape(pattern[i])); i += 1
+              return re.fullmatch(''.join(parts), path) is not None
+          
+          
+          def classify_paths(config, files):
+              return sorted(area for area, rule in config['areas'].items()
+                            if any(matches(path, pattern) for path in files for pattern in rule['paths']))
+          
+          
+          def section(body, heading):
+              match = re.search(r'^### ' + re.escape(heading) + r'\s*\n(.*?)(?=^### |\Z)',
+                                (body or '').replace('\r\n', '\n'), re.M | re.S)
+              return match.group(1).strip() if match else None
+          
+          
+          def issue_areas(config, body):
+              answer = section(body, '所属模块')
+              if not answer or answer in {'不确定 / 需要协助', '_No response_'}:
+                  return None
+              choices = {area + ' — ' + rule['title']: area for area, rule in config['areas'].items()}
+              values = [x.strip() for x in answer.split(',')]
+              if not values or any(v not in choices for v in values):
+                  return None
+              return sorted({choices[v] for v in values})
+          
+          
+          def declared_kind(body):
+              value = section(body, '事项类型')
+              if not value:
+                  return None
+              selected = re.findall(r'^- \[[xX]\] (kind/[a-z]+)(?:\s|$)', value, re.M)
+              if len(selected) == 1 and selected[0][5:] in KINDS:
+                  return selected[0]
+              if value in {'kind/' + k for k in KINDS}:
+                  return value
+              return None
+          
+          
+          def commands(body):
+              lines = (body or '').strip().splitlines()
+              if not lines or len(lines) > 8 or not all(line.startswith('/') for line in lines):
+                  return []
+              parsed = []
+              for line in lines:
+                  words = line.split()
+                  if words[0] not in {'/kind', '/area', '/priority', '/triage'}:
+                      return []
+                  parsed.append(words)
+              return parsed
+          
+          
+          def valid_command(config, cmd):
+              if len(cmd) == 2 and cmd[0] == '/kind':
+                  return cmd[1] in KINDS
+              if len(cmd) == 2 and cmd[0] == '/priority':
+                  return cmd[1] in PRIORITIES
+              if len(cmd) >= 3 and cmd[:2] == ['/area', 'set']:
+                  return all('area/' + a.removeprefix('area/') in config['areas'] for a in cmd[2:])
+              return cmd in [['/area', 'auto'], ['/triage', 'accept'], ['/triage', 'needs-info']]
+          
+          
+          def history_state(api, repo, timeline, config):
+              """审计记录直接来自 GitHub 时间线；无需评论存状态或额外数据库。"""
+              auto_after = ''
+              area_commands = []
+              kind_commands = []
+              accepted_at = ''
+              manual = {'area/': [], 'kind/': []}
+              origins = {}
+              for row in timeline:
+                  stamp = row.get('created_at', '')
+                  actor = row.get('actor') or row.get('user') or {}
+                  login = actor.get('login', '')
+                  event = row.get('event')
+                  if event in {'labeled', 'unlabeled'}:
+                      name = (row.get('label') or {}).get('name', '')
+                      origins[name] = login if event == 'labeled' else None
+                      if login != BOT:
+                          for prefix in manual:
+                              if name.startswith(prefix):
+                                  manual[prefix].append(stamp)
+                      if event == 'unlabeled' and name == NEEDS and login != BOT and login and api.writer(repo, login):
+                          accepted_at = max(accepted_at, stamp)
+                  elif event == 'commented':
+                      cmds = commands(row.get('body'))
+                      if not cmds or not login or not api.writer(repo, login):
+                          continue
+                      for cmd in cmds:
+                          if not valid_command(config, cmd):
+                              continue
+                          if cmd == ['/area', 'auto']:
+                              auto_after = max(auto_after, stamp)
+                          elif len(cmd) >= 3 and cmd[:2] == ['/area', 'set']:
+                              area_commands.append(stamp)
+                          elif len(cmd) == 2 and cmd[0] == '/kind' and cmd[1] in KINDS:
+                              kind_commands.append(stamp)
+                          elif cmd == ['/triage', 'accept']:
+                              accepted_at = max(accepted_at, stamp)
+              return {'area_locked': any(s >= auto_after for s in manual['area/'] + area_commands),
+                      'kind_locked': bool(manual['kind/'] or kind_commands),
+                      'origins': origins, 'accepted_at': accepted_at}
+          
+          
+          def replace_namespace(labels, prefix, values):
+              return {x for x in labels if not x.startswith(prefix)} | set(values)
+          
+          
+          def complete(labels):
+              return (sum(x.startswith('kind/') for x in labels) == 1
+                      and sum(x.startswith('priority/') for x in labels) == 1
+                      and any(x.startswith('area/') for x in labels))
+          
+          
+          def apply_command(config, labels, cmd):
+              updated = set(labels)
+              if len(cmd) == 2 and cmd[0] == '/kind' and cmd[1] in KINDS:
+                  updated = replace_namespace(updated, 'kind/', ['kind/' + cmd[1]])
+              elif len(cmd) == 2 and cmd[0] == '/priority' and cmd[1] in PRIORITIES:
+                  updated = replace_namespace(updated, 'priority/', ['priority/' + cmd[1]])
+              elif len(cmd) >= 3 and cmd[:2] == ['/area', 'set']:
+                  areas = {'area/' + name.removeprefix('area/') for name in cmd[2:]}
+                  if not areas <= config['areas'].keys():
+                      raise ValueError('模块不在当前仓库的配置中')
+                  updated = replace_namespace(updated, 'area/', areas)
+              elif cmd == ['/area', 'auto']:
+                  pass
+              elif cmd == ['/triage', 'accept']:
+                  if not complete(updated):
+                      raise ValueError('确认前必须设置一个类型、一个优先级和至少一个模块')
+                  updated.discard(NEEDS)
+                  updated.discard(INFO)
+              elif cmd == ['/triage', 'needs-info']:
+                  updated |= {NEEDS, INFO}
+              else:
+                  raise ValueError('无效命令；参见 .github/TRIAGE.md')
+              if cmd[0] in {'/kind', '/priority', '/area'} and updated != labels:
+                  updated.add(NEEDS)
+              return updated
+          
+          
+          def write_labels(api, repo, number, before, after):
+              """按差量写入，不用 setLabels 覆盖其他人的无关标签。"""
+              endpoint = f'/repos/{repo}/issues/{number}/labels'
+              added = sorted(after - before)
+              if added:
+                  api.request('POST', endpoint, {'labels': added})
+              for label in sorted(before - after):
+                  try:
+                      api.request('DELETE', endpoint + '/' + urllib.parse.quote(label, safe=''))
+                  except APIError as exc:
+                      if exc.status != 404:
+                          raise
+              return {'add': added, 'remove': sorted(before - after)}
+          
+          
+          def item_proposal(api, repo, config, item, timeline, files=None, force_area=False):
+              labels = {x['name'] for x in item['labels']}
+              result = set(labels)
+              state = history_state(api, repo, timeline, config)
+              if 'pull_request' in item:
+                  candidates = classify_paths(config, files) if files is not None else None
+              else:
+                  candidates = issue_areas(config, item.get('body'))
+              if candidates is not None and (force_area or not state['area_locked']):
+                  old_auto = {x for x in labels if x.startswith('area/') and (force_area or state['origins'].get(x) == BOT)}
+                  result -= old_auto
+                  result |= set(candidates)
+              kind = declared_kind(item.get('body'))
+              if item['user']['login'] in {'dependabot[bot]', 'renovate[bot]'} and 'pull_request' in item:
+                  kind = 'kind/dependency'
+              if kind and not state['kind_locked']:
+                  owned = {x for x in labels if x.startswith('kind/') and state['origins'].get(x) != BOT}
+                  if not owned:
+                      result = replace_namespace(result, 'kind/', [kind])
+              active = item.get('state') == 'open'
+              if active and (not complete(result) or not state['accepted_at'] or result != labels):
+                  result.add(NEEDS)
+              if active and 'pull_request' in item and files is None:
+                  result.add(NEEDS)
+              return result, state
+          
+          
+          def pr_files(api, repo, number):
+              pr = api.request('GET', f'/repos/{repo}/pulls/{number}')
+              if pr.get('changed_files', 0) > 3000:
+                  return None
+              rows = list(api.pages(f'/repos/{repo}/pulls/{number}/files'))
+              if len(rows) != pr.get('changed_files', len(rows)):
+                  return None
+              return [path for row in rows for path in [row['filename'], row.get('previous_filename')] if path]
+          
+          
+          def effective_commands(api, repo, timeline, config):
+              """恢复每个维度最后的维护者命令，抵抗 Actions 合并待运行事件。"""
+              latest = {}
+              manual = {}
+              last_pending = -1
+              for index, row in enumerate(timeline):
+                  actor = row.get('actor') or row.get('user') or {}
+                  login = actor.get('login', '')
+                  if row.get('event') in {'labeled', 'unlabeled'}:
+                      label = row.get('label', {}).get('name', '')
+                      if label == NEEDS and row['event'] == 'labeled':
+                          last_pending = index
+                      if login != BOT:
+                          key = '/' + label.split('/')[0]
+                          manual[key] = index
+                  elif row.get('event') == 'commented':
+                      cmds = commands(row.get('body'))
+                      if cmds and login and api.writer(repo, login):
+                          for cmd in cmds:
+                              if valid_command(config, cmd):
+                                  latest[cmd[0]] = (index, cmd, row.get('id'))
+              return [(index, cmd, comment_id) for key, (index, cmd, comment_id) in latest.items()
+                      if index > manual.get(key, -1)
+                      and not (cmd == ['/triage', 'accept'] and index < last_pending)]
+          
+          
+          def handle_event(api, event_name, event, config=None):
+              repo = event['repository']['full_name']
+              item = event.get('issue') or event.get('pull_request')
+              if event_name == 'workflow_dispatch':
+                  number = int(event['inputs']['number'])
+              elif item:
+                  number = item['number']
+              else:
+                  return {'skipped': '没有 Issue/PR 编号'}
+              if event.get('sender', {}).get('login') == BOT and event.get('action') in {'labeled', 'unlabeled'}:
+                  return {'skipped': '忽略机器人标签回环'}
+              config = config or load_config(api, repo, event['repository']['default_branch'])
+              current = api.request('GET', f'/repos/{repo}/issues/{number}')
+              before = {x['name'] for x in current['labels']}
+              timeline = list(api.pages(f'/repos/{repo}/issues/{number}/timeline'))
+              files = pr_files(api, repo, number) if 'pull_request' in current else None
+              requested = commands(event.get('comment', {}).get('body')) if event_name == 'issue_comment' else []
+              if event_name == 'issue_comment':
+                  if event.get('action') != 'created' or not requested:
+                      return {'skipped': '不是新分诊命令'}
+                  login = event['comment']['user']['login']
+                  if not api.writer(repo, login):
+                      return {'skipped': '命令作者没有 write/maintain/admin 权限'}
+                  # 先验证当前命令，再根据完整时间线执行每个维度的最新命令。
+                  validation = set(before)
+                  for cmd in requested:
+                      if cmd != ['/triage', 'accept']:
+                          validation = apply_command(config, validation, cmd)
+              active_commands = effective_commands(api, repo, timeline, config)
+              force = any(cmd == ['/area', 'auto'] for _, cmd, _ in active_commands)
+              after, state = item_proposal(api, repo, config, current, timeline, files, force)
+              auto_changed = after - {NEEDS, INFO} != before - {NEEDS, INFO}
+              if event_name == 'issues' and event.get('action') == 'edited' and issue_areas(config, current.get('body')) is None:
+                  after.add(NEEDS)
+              last_classification_command = max((i for i, cmd, _ in active_commands if cmd[0] != '/triage'), default=-1)
+              for index, cmd, comment_id in sorted(active_commands):
+                  if cmd == ['/triage', 'accept']:
+                      if index < last_classification_command:
+                          continue
+                      if auto_changed and comment_id != event.get('comment', {}).get('id'):
+                          continue
+                  try:
+                      after = apply_command(config, after, cmd)
+                  except ValueError:
+                      if comment_id == event.get('comment', {}).get('id'):
+                          raise
+                      # 历史无效命令不能阻断未来分诊。
+                      continue
+              if event.get('action') == 'labeled' and event.get('sender', {}).get('login') != BOT:
+                  for prefix in ('kind/', 'priority/'):
+                      ordered = [r['label']['name'] for r in timeline if r.get('event') == 'labeled'
+                                 and r.get('label', {}).get('name', '').startswith(prefix)
+                                 and r['label']['name'] in before]
+                      if ordered and sum(x.startswith(prefix) for x in after) > 1:
+                          after = replace_namespace(after, prefix, [ordered[-1]])
+              if event.get('action') == 'unlabeled' and event.get('label', {}).get('name') == NEEDS:
+                  if complete(after) and event.get('sender', {}).get('login') and api.writer(repo, event['sender']['login']):
+                      after.discard(NEEDS)
+              # 写前再次读取。有人在计算期间改过标签则失败，避免覆盖并发人工操作。
+              latest = api.request('GET', f'/repos/{repo}/issues/{number}')
+              if {x['name'] for x in latest['labels']} != before:
+                  raise RuntimeError('计算期间标签发生变化；重新运行即可，不覆盖并发操作。')
+              changes = write_labels(api, repo, number, before, after)
+              return {'repository': repo, 'number': number, **changes, 'manual_area': state['area_locked']}
+          
+          
+          def sync_definitions(api, repo, config, apply=False):
+              existing = {x['name']: x for x in api.pages(f'/repos/{repo}/labels')}
+              report = []
+              aliases = config.get('aliases', {})
+              for old, new in aliases.items():
+                  if old not in existing or old == new:
+                      continue
+                  if new not in existing:
+                      report.append({'rename': old, 'to': new})
+                      if apply:
+                          item = api.request('PATCH', f'/repos/{repo}/labels/' + urllib.parse.quote(old, safe=''), {'new_name': new})
+                          existing[new] = item
+                      else:
+                          existing[new] = {**existing[old], 'name': new}
+                      existing.pop(old)
+                  else:
+                      # 同义标签已并存：先给全部关联条目补新标签，再删除旧定义。
+                      affected = list(api.pages(f'/repos/{repo}/issues?state=all&labels=' + urllib.parse.quote(old, safe='')))
+                      report.append({'merge': old, 'into': new, 'items': [x['number'] for x in affected]})
+                      if apply:
+                          for item in affected:
+                              api.request('POST', f'/repos/{repo}/issues/{item["number"]}/labels', {'labels': [new]})
+                          api.request('DELETE', f'/repos/{repo}/labels/' + urllib.parse.quote(old, safe=''))
+                      existing.pop(old)
+              for label in config['labels']:
+                  previous = existing.get(label['name'])
+                  if previous is None:
+                      report.append({'create': label['name']})
+                      if apply:
+                          api.request('POST', f'/repos/{repo}/labels', label)
+                  elif any(previous.get(k) != label[k] for k in ('color', 'description')):
+                      report.append({'update': label['name']})
+                      if apply:
+                          api.request('PATCH', f'/repos/{repo}/labels/' + urllib.parse.quote(label['name'], safe=''), label)
+              return report
+          
+          
+          PROJECT_QUERY = '''query($owner:String!,$number:Int!){organization(login:$owner){projectV2(number:$number){id title fields(first:100){nodes{... on ProjectV2Field{id name dataType} ... on ProjectV2SingleSelectField{id name options{id name color description}}}}}}}'''
+          ITEMS_QUERY = '''query($id:ID!,$cursor:String){node(id:$id){... on ProjectV2{items(first:100,after:$cursor){pageInfo{hasNextPage endCursor} nodes{id fieldValues(first:100){nodes{... on ProjectV2ItemFieldSingleSelectValue{name field{... on ProjectV2SingleSelectField{name}}}}} content{... on Issue{number repository{nameWithOwner}} ... on PullRequest{number repository{nameWithOwner}}}}}}}}'''
+          
+          
+          def project_info(api, owner, number):
+              org = api.graphql(PROJECT_QUERY, owner=owner, number=number)['organization']
+              if not org or not org['projectV2']:
+                  raise RuntimeError('Project 不存在或当前身份无权访问')
+              return org['projectV2']
+          
+          
+          def project_items(api, project_id):
+              cursor = None
+              while True:
+                  page = api.graphql(ITEMS_QUERY, id=project_id, cursor=cursor)['node']['items']
+                  yield from page['nodes']
+                  if not page['pageInfo']['hasNextPage']:
+                      break
+                  cursor = page['pageInfo']['endCursor']
+          
+          
+          def ensure_fields(api, project, configs, apply=False):
+              desired = {'Domain': sorted({c['domain'] for c in configs.values()}),
+                         'Priority': ['P0', 'P1', 'P2', 'P3'], 'Triage': ['Needs triage', 'Needs info', 'Accepted']}
+              fields = {x['name']: x for x in project['fields']['nodes'] if x and 'name' in x}
+              report = []
+              for name, options in desired.items():
+                  if name not in fields:
+                      report.append({'create_field': name, 'options': options})
+                      if apply:
+                          result = api.graphql('''mutation($input:CreateProjectV2FieldInput!){createProjectV2Field(input:$input){projectV2Field{... on ProjectV2SingleSelectField{id name options{id name}}}}}''',
+                              input={'projectId': project['id'], 'dataType': 'SINGLE_SELECT', 'name': name,
+                                     'singleSelectOptions': [{'name': opt, 'color': 'BLUE', 'description': ''} for opt in options]})
+                          fields[name] = result['createProjectV2Field']['projectV2Field']
+                  else:
+                      if 'options' not in fields[name]:
+                          raise ValueError(f'Project 字段 {name} 必须是单选字段；不会覆盖已有不同类型字段。')
+                      missing = sorted(set(options) - {o['name'] for o in fields[name]['options']})
+                      if missing:
+                          # 不重新创建选项；那会破坏现有 option ID 与历史条目。
+                          raise ValueError(f'Project 字段 {name} 缺少选项 {missing}；请在界面补充，保留现有选项。')
+              return fields, report
+          
+          
+          def field_values(labels, domain):
+              priority = [x[9:].upper() for x in labels if x.startswith('priority/') and x[9:] in PRIORITIES]
+              triage = 'Needs info' if INFO in labels else 'Needs triage' if NEEDS in labels or not complete(labels) else 'Accepted'
+              return {'Domain': domain, 'Priority': priority[0] if len(priority) == 1 else None, 'Triage': triage}
+          
+          
+          def sync_project(api, configs, owner='XiaoJiTeam', number=1, apply=False, only_repo=None, only_number=None):
+              project = project_info(api, owner, number)
+              fields, report = ensure_fields(api, project, configs, apply)
+              for item in project_items(api, project['id']):
+                  content = item.get('content') or {}
+                  repo = content.get('repository', {}).get('nameWithOwner')
+                  if repo not in configs or (only_repo and repo != only_repo) or (only_number and content.get('number') != only_number):
+                      continue
+                  issue = api.request('GET', f'/repos/{repo}/issues/{content["number"]}')
+                  labels = {x['name'] for x in issue['labels']}
+                  current = {v['field']['name']: v['name'] for v in item['fieldValues']['nodes'] if 'field' in v}
+                  desired = field_values(labels, configs[repo]['domain'])
+                  for name, value in desired.items():
+                      # Domain 只填空，保留人工覆盖；Priority/Triage 由标签权威同步。
+                      if name == 'Domain' and current.get(name):
+                          continue
+                      if current.get(name) == value:
+                          continue
+                      report.append({'repository': repo, 'number': content['number'], 'field': name, 'value': value})
+                      if apply:
+                          field = fields[name]
+                          common = {'projectId': project['id'], 'itemId': item['id'], 'fieldId': field['id']}
+                          if value is None:
+                              api.graphql('''mutation($input:ClearProjectV2ItemFieldValueInput!){clearProjectV2ItemFieldValue(input:$input){projectV2Item{id}}}''', input=common)
+                          else:
+                              option = next(o['id'] for o in field['options'] if o['name'] == value)
+                              api.graphql('''mutation($input:UpdateProjectV2ItemFieldValueInput!){updateProjectV2ItemFieldValue(input:$input){projectV2Item{id}}}''', input={**common, 'value': {'singleSelectOptionId': option}})
+              return report
+          
+          
+          def backfill_preview(api, configs, scope='project', owner='XiaoJiTeam', number=1):
+              if scope == 'project':
+                  project = project_info(api, owner, number)
+                  selected = [(i['content']['repository']['nameWithOwner'], i['content']['number'])
+                              for i in project_items(api, project['id']) if (i.get('content') or {}).get('repository')]
+              else:
+                  selected = [(repo, i['number']) for repo in configs for i in api.pages(f'/repos/{repo}/issues?state=all')]
+              report = []
+              for repo, item_number in selected:
+                  if repo not in configs:
+                      continue
+                  item = api.request('GET', f'/repos/{repo}/issues/{item_number}')
+                  timeline = list(api.pages(f'/repos/{repo}/issues/{item_number}/timeline'))
+                  files = pr_files(api, repo, item_number) if 'pull_request' in item else None
+                  before = {l['name'] for l in item['labels']}
+                  after, state = item_proposal(api, repo, configs[repo], item, timeline, files)
+                  # 历史回填只补充，避免移除已有标签。需负责人逐项将 approved 改为 true。
+                  additions = sorted(after - before)
+                  report.append({'repository': repo, 'number': item_number, 'state': item['state'],
+                                 'url': item['html_url'], 'before': sorted(before), 'add': additions,
+                                 'evidence': {'paths': files, 'form_areas': issue_areas(configs[repo], item.get('body')),
+                                              'declared_kind': declared_kind(item.get('body')), 'manual_area': state['area_locked']},
+                                 'needs_review': not complete(after) or NEEDS in after, 'approved': False})
+              return {'schema_version': 1, 'scope': scope, 'items': report}
+          
+          
+          def apply_backfill(api, configs, report):
+              results = []
+              for row in report['items']:
+                  if row.get('approved') is not True:
+                      continue
+                  repo = row['repository']
+                  if repo not in configs:
+                      raise ValueError('回填仓库不在允许清单中')
+                  allowed = {l['name'] for l in configs[repo]['labels']}
+                  if not set(row['add']) <= allowed or any(x.startswith('priority/') for x in row['add']):
+                      raise ValueError('回填不能设置优先级或配置外标签；优先级请由负责人命令确认')
+                  current = api.request('GET', f'/repos/{repo}/issues/{row["number"]}')
+                  before = {x['name'] for x in current['labels']}
+                  intended = set(row['before']) | set(row['add'])
+                  if any(sum(x.startswith(prefix) for x in intended) > 1 for prefix in ('kind/', 'priority/')):
+                      raise ValueError('回填结果违反类型或优先级唯一规则，请重新分诊')
+                  if before == intended:
+                      results.append({'repository': repo, 'number': row['number'], 'skipped': '已经应用'})
+                      continue
+                  if before != set(row['before']) or current['state'] != row['state']:
+                      results.append({'repository': repo, 'number': row['number'], 'skipped': '预览后条目已变化，请重新预览'})
+                      continue
+                  results.append({'repository': repo, 'number': row['number'], **write_labels(api, repo, row['number'], before, intended)})
+              return results
+          
+          
+          def main():
+              parser = argparse.ArgumentParser(description=__doc__)
+              parser.add_argument('command', choices=['event', 'labels', 'project', 'backfill-preview', 'backfill-apply'])
+              parser.add_argument('--catalog', type=Path, default=Path('triage/catalog'))
+              parser.add_argument('--repo')
+              parser.add_argument('--number', type=int)
+              parser.add_argument('--scope', choices=['project', 'repositories'], default='project')
+              parser.add_argument('--report', type=Path)
+              parser.add_argument('--apply', action='store_true')
+              args = parser.parse_args()
+              api = GitHub(os.environ.get('GITHUB_TOKEN') if args.command == 'event' else None)
+              if args.command == 'event':
+                  event = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text())
+                  config = load_config(api, event['repository']['full_name'], event['repository']['default_branch'])
+                  result = handle_event(api, os.environ['GITHUB_EVENT_NAME'], event, config)
+                  if os.environ.get('PROJECT_TOKEN') and result.get('number'):
+                      result['project'] = sync_project(GitHub(os.environ['PROJECT_TOKEN']),
+                          {config['repository']: config}, apply=True,
+                          only_repo=result['repository'], only_number=result['number'])
+              else:
+                  configs = read_catalog(args.catalog)
+                  selected = {k: v for k, v in configs.items() if not args.repo or k == args.repo}
+                  if not selected:
+                      raise ValueError('仓库不在中央接入清单内')
+                  if args.command == 'labels':
+                      result = {repo: sync_definitions(api, repo, config, args.apply) for repo, config in selected.items()}
+                  elif args.command == 'project':
+                      result = sync_project(api, configs, apply=args.apply, only_repo=args.repo, only_number=args.number)
+                  elif args.command == 'backfill-preview':
+                      result = backfill_preview(api, selected, args.scope)
+                  else:
+                      if not args.apply or not args.report:
+                          raise ValueError('回填需要 --apply --report，并逐项设置 approved=true')
+                      result = apply_backfill(api, selected, json.loads(args.report.read_text()))
+              output = json.dumps(result, ensure_ascii=False, indent=2) + '\n'
+              if args.report and args.command != 'backfill-apply':
+                  args.report.write_text(output)
+                  print(f'已写入报告：{args.report}')
+              else:
+                  print(output)
+          
+          
+          if __name__ == '__main__':
+              main()
+          XIAOJI_TRIAGE_PY

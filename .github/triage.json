@@ -1,0 +1,229 @@
+{
+  "schema_version": 1,
+  "repository": "XiaoJiTeam/new-api",
+  "default_branch": "main",
+  "domain": "人工智能",
+  "has_issues": false,
+  "areas": {
+    "area/relay": {
+      "title": "上游模型转发",
+      "paths": [
+        "relay/**"
+      ]
+    },
+    "area/protocols": {
+      "title": "模型协议转换",
+      "paths": [
+        "relaykit/**"
+      ]
+    },
+    "area/token-counting": {
+      "title": "Token 统计",
+      "paths": [
+        "tokenkit/**"
+      ]
+    },
+    "area/web": {
+      "title": "管理界面",
+      "paths": [
+        "web/**"
+      ]
+    },
+    "area/desktop": {
+      "title": "桌面封装",
+      "paths": [
+        "electron/**"
+      ]
+    },
+    "area/plugins": {
+      "title": "任务插件",
+      "paths": [
+        "plugins/**",
+        "pkg/jsplugin/**"
+      ]
+    },
+    "area/billing": {
+      "title": "计费与配额",
+      "paths": [
+        "pkg/billingexpr/**",
+        "service/quota*",
+        "service/tiered_settle*",
+        "service/*billing*",
+        "setting/billing_setting/**"
+      ]
+    },
+    "area/authentication": {
+      "title": "会话授权与 OAuth",
+      "paths": [
+        "oauth/**",
+        "service/authz/**"
+      ]
+    },
+    "area/i18n": {
+      "title": "国际化",
+      "paths": [
+        "i18n/**",
+        "web/src/i18n/**"
+      ]
+    },
+    "area/database": {
+      "title": "数据库结构与持久化",
+      "paths": [
+        "model/**"
+      ]
+    },
+    "area/deployment": {
+      "title": "构建部署与运行配置",
+      "paths": [
+        "Dockerfile*",
+        "docker-compose*.yml"
+      ]
+    },
+    "area/documentation": {
+      "title": "项目文档与手册",
+      "paths": [
+        "docs/**",
+        "README*"
+      ]
+    },
+    "area/automation": {
+      "title": "仓库工作流与分诊配置",
+      "paths": [
+        ".github/**"
+      ]
+    }
+  },
+  "labels": [
+    {
+      "name": "kind/bug",
+      "color": "1D76DB",
+      "description": "缺陷；最多选择一种类型"
+    },
+    {
+      "name": "kind/feature",
+      "color": "1D76DB",
+      "description": "新功能；最多选择一种类型"
+    },
+    {
+      "name": "kind/task",
+      "color": "1D76DB",
+      "description": "工程任务；最多选择一种类型"
+    },
+    {
+      "name": "kind/refactor",
+      "color": "1D76DB",
+      "description": "内部重构；最多选择一种类型"
+    },
+    {
+      "name": "kind/docs",
+      "color": "1D76DB",
+      "description": "文档；最多选择一种类型"
+    },
+    {
+      "name": "kind/dependency",
+      "color": "1D76DB",
+      "description": "依赖维护；最多选择一种类型"
+    },
+    {
+      "name": "kind/question",
+      "color": "1D76DB",
+      "description": "咨询与讨论；最多选择一种类型"
+    },
+    {
+      "name": "priority/p0",
+      "color": "B60205",
+      "description": "立即处理：核心线上故障或正在发生的数据损坏；由负责人确认"
+    },
+    {
+      "name": "priority/p1",
+      "color": "D93F0B",
+      "description": "高优先级：关键能力或重要交付受阻；由负责人确认"
+    },
+    {
+      "name": "priority/p2",
+      "color": "FBCA04",
+      "description": "正常排期：已确认需要推进；由负责人确认"
+    },
+    {
+      "name": "priority/p3",
+      "color": "C2E0C6",
+      "description": "低优先级：可延后的改进；由负责人确认"
+    },
+    {
+      "name": "triage/needs-triage",
+      "color": "D4C5F9",
+      "description": "等待负责人确认类型、模块与优先级"
+    },
+    {
+      "name": "triage/needs-info",
+      "color": "FEF2C0",
+      "description": "信息不足，等待补充"
+    },
+    {
+      "name": "area/relay",
+      "color": "0E8A16",
+      "description": "上游模型转发"
+    },
+    {
+      "name": "area/protocols",
+      "color": "0E8A16",
+      "description": "模型协议转换"
+    },
+    {
+      "name": "area/token-counting",
+      "color": "0E8A16",
+      "description": "Token 统计"
+    },
+    {
+      "name": "area/web",
+      "color": "0E8A16",
+      "description": "管理界面"
+    },
+    {
+      "name": "area/desktop",
+      "color": "0E8A16",
+      "description": "桌面封装"
+    },
+    {
+      "name": "area/plugins",
+      "color": "0E8A16",
+      "description": "任务插件"
+    },
+    {
+      "name": "area/billing",
+      "color": "0E8A16",
+      "description": "计费与配额"
+    },
+    {
+      "name": "area/authentication",
+      "color": "0E8A16",
+      "description": "会话授权与 OAuth"
+    },
+    {
+      "name": "area/i18n",
+      "color": "0E8A16",
+      "description": "国际化"
+    },
+    {
+      "name": "area/database",
+      "color": "0E8A16",
+      "description": "数据库结构与持久化"
+    },
+    {
+      "name": "area/deployment",
+      "color": "0E8A16",
+      "description": "构建部署与运行配置"
+    },
+    {
+      "name": "area/documentation",
+      "color": "0E8A16",
+      "description": "项目文档与手册"
+    },
+    {
+      "name": "area/automation",
+      "color": "0E8A16",
+      "description": "仓库工作流与分诊配置"
+    }
+  ],
+  "aliases": {}
+}
